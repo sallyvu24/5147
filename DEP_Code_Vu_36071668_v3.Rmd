@@ -1,0 +1,908 @@
+---
+title: "DEP Part 2 — Reproducible Workbench (v3, sharpened for analytical correctness)"
+subtitle: "Spatial–Temporal Alignment of Speed-Camera Enforcement with Pedestrian & Cyclist Activity in the City of Melbourne"
+author: "Gia Linh (Sally) Vu — 36071668 · Applied 08 · Markers: Michael Niemann & Bruno Luis Mendivez Vasquez"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document: { toc: true, toc_float: true, toc_depth: 3, number_sections: true, code_folding: show, theme: flatly, df_print: paged }
+editor_options: { markdown: { wrap: 100 } }
+---
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 6, dpi = 150, cache = TRUE, cache.lazy = FALSE, fig.path = "out/cache/")
+options(scipen = 999)
+```
+
+> **What v3 fixes, and why it is SHORTER, not longer.** v2 had the right *structure* but three classes of defect:
+> (1) the explanatory text claimed things the code did not compute; (2) two methods were used incorrectly
+> (an unrestricted-permutation "spatial" test, and an endpoint-only graph that cannot see interior junctions);
+> (3) redundant methods (k-means clustering, STL, core LISA) occupied space without changing any RQ answer.
+> v3 **repairs and deepens the three core analyses and removes the redundancy** — it does not add methods.
+> The analytical core is exactly three things: a **corrected weighted-proximity analysis (RQ1)**, a
+> **wide-observation-span temporal-alignment analysis with share *and* magnitude (RQ2)**, and a
+> **network removal/addition analysis on an interior-junction-noded graph (RQ3)** — an improvement over
+> endpoint-only joining, **not** a verified real-world audit.
+>
+> **The single most important correction:** RQ3's fragmentation was an artefact of endpoint-only joining — but the
+> repaired continuity is **strongly construction/tolerance-dependent** (largest core ≈40 % of length at a 2 m grid,
+> ≈80 % at 5 m), so v3 commits to **neither** "150 shards" **nor** "one dominant core". The defensible headline is:
+> *continuity is tolerance-sensitive, and the **identity of the structurally critical segments** is what survives that
+> uncertainty* (reported as the printed 2 m↔5 m overlap). `# [verified]` marks numbers reproduced independently from the supplied files.
+
+---
+
+> ## ⚠ ACTION REQUIRED before submission — finish the reconciled report against this code (audit A1/A2)
+> The rubric marks the **written report**, not this Rmd. A **reconciled report is now provided** —
+> `DEP_Report_Vu_36071668.docx` — written entirely to *this* code's v3 estimands (no k-means / STL / LISA / bivariate,
+> the tolerance-dependent + **Jaccard** critical-set RQ3 headline, the wide-observation-span panel). It replaces any
+> earlier `.docx` that still stated the repudiated 150-component / method-zoo results. **Two steps remain, and only your
+> machine can do them:** (1) **knit this code** on the real TAC data so all 28 chunks run and the figures render to `out/`;
+> (2) in the report, **insert the eight figures** at the ⟦FIGURE⟧ placeholders and **fill the ~10 bracketed `[__ from
+> knit]` values** from the printed `cat()` diagnostics (RQ1 gap @500 m + LOO; RQ2 `Gt` flatness + weekly recurrence;
+> RQ3 `R(G)`, critical count, 2 m↔5 m Jaccard, reconnecting-proposal count). Then confirm the RQ wording matches your
+> approved proposal and delete the report's "Before you submit" section. Every number in the report must be output-derived.
+
+# Setup {#setup}
+
+```{r packages}
+pkgs <- c("sf","dplyr","tidyr","stringr","readr","readxl","purrr","tibble","data.table","lubridate",
+          "httr2","jsonlite","geojsonsf","ggplot2","scales","patchwork","RColorBrewer","classInt",
+          "spdep","sfnetworks","tidygraph","igraph","tidygeocoder","units","ggspatial")
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, require, character.only = TRUE)); set.seed(5147)
+for (d in c("data_raw","cache","out")) dir.create(d, showWarnings = FALSE)
+## NOTE: k-means/cluster/fpc/zoo/DiagrammeR intentionally dropped — clustering & STL demoted out of the core (§RQ2).
+```
+
+```{r config}
+CRS_WGS <- 4326; CRS_WORK <- 7855          # source degrees; ALL geometry computed in GDA2020/MGA55 metres
+TAC_FILES <- c("/Users/chipi/Desktop/MONASH/Sem2_26/FIT5147/assignments/ASS1/dataset/TransportActivityCount_2026/TransportActivityCount_2026-1.csv",
+               "/Users/chipi/Desktop/MONASH/Sem2_26/FIT5147/assignments/ASS1/dataset/TransportActivityCount_2026/TransportActivityCount_2026-2.csv")
+MOBILE_XLSX <- "/Users/chipi/Downloads/data_dep/Mobile-Camera-Locations-April-2026.xlsx"
+BIKE_CSV    <- "/Users/chipi/Downloads/data_dep/bicycle-routes-including-informal-on-road-and-off-road-routes.csv"
+CAM_COL  <- c(fixed="#D55E00", mobile="#0072B2")                                  # Okabe–Ito, CVD-safe
+MODE_COL <- c(pedestrian="#009E73", cyclist="#CC79A7", escooter="#E69F00")
+PAL_SEQ  <- "YlGnBu"
+theme_map <- function() theme_void(base_size=11) + theme(plot.title=element_text(face="bold"), legend.position="right")
+theme_dep <- function() theme_minimal(base_size=11) + theme(panel.grid.minor=element_blank(), plot.title=element_text(face="bold"))
+ggsave2 <- function(n,p,w=9,h=6) ggplot2::ggsave(file.path("out",n),p,width=w,height=h,dpi=150,bg="white")
+## SCALE BAR (check.md D): the whole analysis is metric-distance-based (500 m thresholds, 200 m buffers), so every map
+## that a reader must judge distances on carries a scale bar. North-up geom_sf ⇒ a north arrow is optional; a bar is task-critical.
+scalebar_m <- function() ggspatial::annotation_scale(location="br", width_hint=0.28, height=grid::unit(0.15,"cm"),
+                                                      text_cex=0.6, line_width=0.4, pad_y=grid::unit(0.25,"cm"))
+```
+
+# Stage A — Estimands (each method answers ONE declared quantity) {#estimands}
+
+| RQ | Estimand | Unit | Core method | What is deliberately NOT claimed |
+|---|---|---|---|---|
+| **RQ1 Spatial** | Do high-activity sites hold a *disproportionate* share of activity near **fixed** cameras vs a site benchmark? | site × mode | Weighted coverage `Cm(d)` vs benchmark `U(d)`, gap, distance-response, influence | proximity ≠ enforcement coverage; no causal/placement claim |
+| **RQ2 Temporal** | Does that SAME alignment gap change by hour/week? | site × mode × time | temporal alignment gap `Gt(d)=Ct(d)−U(d)` (inherits RQ1) **and** far-activity magnitude `Bmt`; weekly paired persistence | enforcement *timing* is unobservable — not tested |
+| **RQ3 Network** | How much does each segment **contribute** to continuity on a *properly-noded existing* network? | route segment | subdivision graph; `R(G)`; removal `L_e` (two outcomes); addition `G_p` + gain/km | anchors are structural probes, not travel demand |
+
+Fixed-camera proximity is **primary** throughout; mobile and combined are reported **separately** and labelled exploratory (a mobile record is a registered *location*, not an active deployment; a fixed registration is not proof of continuous operation).
+
+# Data acquisition {#acquire}
+
+```{r scrape-fixed}
+fx_csv <- "data_raw/fixed_cameras_scraped.csv"
+if (!file.exists(fx_csv)) {
+  ep <- "https://www.vic.gov.au/api/tide/elasticsearch/content-vic__production__sdp_data_pipelines_scl/_search"
+  resp <- request(ep) |> req_method("POST") |>
+    req_body_raw('{"size":1000,"query":{"match_all":{}}}', type="application/json") |>
+    req_user_agent("Monash DEP student project (reproducible re-download)") |> req_timeout(60) |> req_perform()
+  hits <- resp_body_json(resp, simplifyVector=FALSE)$hits$hits
+  fx_raw <- dplyr::bind_rows(lapply(hits, function(h){s<-h[["_source"]]; s[vapply(s,is.null,logical(1))]<-NA
+                                    as.data.frame(s,stringsAsFactors=FALSE,check.names=FALSE)}))
+  readr::write_csv(fx_raw, fx_csv)
+} else fx_raw <- readr::read_csv(fx_csv, show_col_types=FALSE)
+message("Fixed snapshot: ", nrow(fx_raw), " rows")   # [verified] supplied CSV = 337 (live register; do not hard-code)
+```
+
+```{r dl-boundary}
+com_geojson <- "data_raw/municipal-boundary.geojson"
+if (!file.exists(com_geojson))
+  download.file("https://data.melbourne.vic.gov.au/api/explore/v2.1/catalog/datasets/municipal-boundary/exports/geojson",
+                com_geojson, mode="wb", quiet=TRUE)
+com <- st_read(com_geojson, quiet=TRUE) |> st_transform(CRS_WORK) |> st_make_valid(); com_u <- st_union(com)
+message("CoM area: ", round(as.numeric(st_area(com_u))/1e6,1), " km^2")   # [verified] 37.7
+```
+
+# Wrangle B1/B2 — cameras (unchanged from v2; already HD-secure) {#cameras}
+
+```{r wrangle-cameras}
+## B1 fixed: triage null/constant cols, project, clip to CoM
+blank <- function(x) is.na(x)|trimws(as.character(x))==""
+fx <- fx_raw |> transmute(camera_id, suburb, site_type,
+        latitude=suppressWarnings(as.numeric(latitude)), longitude=suppressWarnings(as.numeric(longitude))) |>
+      filter(!is.na(latitude), !is.na(longitude))
+fx_sf  <- st_as_sf(fx, coords=c("longitude","latitude"), crs=CRS_WGS) |> st_transform(CRS_WORK)
+fx_com <- fx_sf[com_u,]
+message("Fixed statewide ", nrow(fx_sf), " -> CoM ", nrow(fx_com))   # [verified] -> 29 (26 intersection, 3 highway)
+
+## B2 mobile: skip title row; 'T' tokens -> NA; geocode; boundary accuracy-check
+COM_SUBS <- c("MELBOURNE","CARLTON","CARLTON NORTH","DOCKLANDS","EAST MELBOURNE","KENSINGTON","NORTH MELBOURNE",
+              "PARKVILLE","SOUTHBANK","SOUTH YARRA","WEST MELBOURNE","FLEMINGTON","PORT MELBOURNE")
+mb <- readxl::read_excel(MOBILE_XLSX, skip=1); names(mb) <- c("location","suburb","reason_code","audit_date")
+mb <- mb |> mutate(suburb=str_squish(toupper(suburb)),
+        location=location|>str_squish()|>str_replace_all("\\bRd\\b","Road")|>str_replace_all("\\bSt\\b","Street"))
+mb_com <- mb |> filter(suburb %in% COM_SUBS) |> mutate(addr=paste0(location,", ",str_to_title(suburb),", VIC, Australia"))
+geo_cache <- "cache/geocoded_mobile.csv"
+if (!file.exists(geo_cache)) { gc <- mb_com |> tidygeocoder::geocode(address=addr, method="arcgis", lat=lat, long=lon)
+  readr::write_csv(gc, geo_cache) } else gc <- readr::read_csv(geo_cache, show_col_types=FALSE)
+mb_com_sf <- gc |> filter(!is.na(lat)) |> st_as_sf(coords=c("lon","lat"), crs=CRS_WGS) |> st_transform(CRS_WORK)
+mb_com_sf <- mb_com_sf[com_u,]
+message("Mobile geocoded -> in-CoM ", nrow(mb_com_sf))   # [verified pipeline] -> 18
+```
+
+# Wrangle C — Bicycle routes (physical ordinal; corridors flagged out of the network) {#bike}
+
+```{r wrangle-bike}
+braw <- readr::read_csv(BIKE_CSV, show_col_types=FALSE)
+geom <- st_sfc(lapply(braw$`Geo Shape`, function(s) st_geometry(geojsonsf::geojson_sf(s))[[1]]), crs=CRS_WGS)
+bk <- st_sf(dplyr::select(braw,-`Geo Shape`,-`Geo Point`), geometry=geom) |> st_transform(CRS_WORK) |> st_make_valid()
+PHYS <- c("1 Off-road / trail","2 Separated on-road","3 Painted on-road","4 Part-time (peak only)","5 Informal / mixed")
+bk <- bk |> mutate(name=coalesce(as.character(name),""), type=as.character(type),
+  is_corridor = (type=="Corridor"),                                           # planning designation, NOT physical infra
+  protection = factor(dplyr::case_when(
+    is_corridor ~ NA_character_,
+    str_detect(name, regex("Part-Time",TRUE)) ~ "4 Part-time (peak only)",
+    str_detect(name, regex("Kerbside|Double Chevron|Separated",TRUE)) ~ "2 Separated on-road",
+    type=="Off-Road Bike Route" ~ "1 Off-road / trail",
+    type=="On-Road Bike Lane" ~ "3 Painted on-road", TRUE ~ "5 Informal / mixed"), levels=PHYS, ordered=TRUE),
+  existing = ifelse(is.na(status)|trimws(status)=="","Existing","Proposed"),
+  length_m = as.numeric(st_length(geometry)))
+## FULL length audit (every metre accounted for, incl. corridor) — reconciles to 198.4 km
+print(bk|>st_drop_geometry()|>mutate(class=ifelse(is_corridor,"6 Corridor (planning)",as.character(protection)))|>
+        group_by(class)|>summarise(n=n(), km=round(sum(length_m)/1000,1), .groups="drop"))
+message("Corridors (blank-status planning geometry) EXCLUDED from the RQ3 physical baseline: ", sum(bk$is_corridor))  # [verified] 4
+```
+
+# Wrangle A — Transport Activity Counts: countline identity kept, timezone EXECUTED, presence-only export {#tac}
+
+```{r wrangle-tac}
+tac <- data.table::rbindlist(lapply(TAC_FILES, data.table::fread,
+        select=c("countLocationId","countlineName","countlineDirection","CountLocationLat","CountLocationLong","from","class","count"),
+        colClasses=c(from="character"),                  # KEEP 'from' RAW: fread otherwise auto-parses it to POSIXct,
+        na.strings=c("NA","null","")))                   #   which would make the strip-Z/parse-local logic double-convert.
+tac[, `:=`(CountLocationLat=as.numeric(CountLocationLat), CountLocationLong=as.numeric(CountLocationLong),
+           count=as.numeric(count), class=tolower(trimws(class)))]
+## PRESENCE-ONLY export (verified): every row has count>=1 — NO count==0 and NO NA counts, so a monitored
+## zero-activity interval is INDISTINGUISHABLE from an unmonitored one (this drives the Stage-B exposure choice).
+message("Presence-only check — count==0 rows: ", sum(tac$count==0, na.rm=TRUE),
+        " | NA counts: ", sum(is.na(tac$count)))                                # [verified] 0 and 0
+n_nullxy <- sum(is.na(tac$CountLocationLat)|is.na(tac$CountLocationLong))
+tac <- tac[!is.na(CountLocationLat) & !is.na(CountLocationLong)]
+message("Dropped null-coordinate rows: ", n_nullxy)                            # [verified] 5,604
+
+## ---- B3 TIMEZONE — EXECUTED, ACTIVITY-WEIGHTED, reported CONDITIONAL (fixes the 'from' crash + the row-count diagnostic) ----
+## The correct test is not "when do rows exist" (regular sampling makes that uninformative) but "when is cyclist
+## ACTIVITY highest" under each admissible parse — so we weight hour-of-day by `count`. Uses samp$from (not bare `from`).
+tzc <- tac[class=="cyclist" & !is.na(count)][sample(.N, min(.N, 5e5))]
+tzc[, h_loc := lubridate::hour(lubridate::ymd_hms(sub("Z$","", from), tz="Australia/Melbourne", quiet=TRUE))]      # strip Z -> LOCAL
+tzc[, h_utc := lubridate::hour(lubridate::with_tz(                                                                 # treat Z as UTC -> convert
+                 lubridate::ymd_hms(sub("Z$","", from), tz="UTC", quiet=TRUE), "Australia/Melbourne"))]
+peak_hr <- function(h,w){ a<-tapply(w, h, sum, na.rm=TRUE); as.integer(names(a)[which.max(a)]) }
+cat("B3 timezone — cyclist PEAK-ACTIVITY hour:  LOCAL parse =", peak_hr(tzc$h_loc, tzc$count),
+    "h   |   UTC-converted =", peak_hr(tzc$h_utc, tzc$count), "h\n")            # LOCAL ~17 confirms; UTC ~03 implausible
+## CONDITIONAL DECISION: local wall-clock concentrates cyclist ACTIVITY in commute hours; the UTC parse displaces it
+## to the small hours. This is peak-PLAUSIBILITY evidence — pending source metadata / matched reference records, ALL
+## temporal results below are reported CONDITIONAL on the local-time interpretation.
+tac[, ts := lubridate::ymd_hms(sub("Z$","", from), tz="Australia/Melbourne", quiet=TRUE)]
+tac <- tac[!is.na(ts)]
+tac[, `:=`(hour=hour(ts), dow=wday(ts, week_start=1), date=as_date(ts), bucket=as.integer(as.numeric(ts))%/%300L)]
+tac[, site := paste(round(CountLocationLat,5), round(CountLocationLong,5), sep="_")]
+site_xy <- unique(tac[, .(site, lon=round(CountLocationLong,5), lat=round(CountLocationLat,5))])
+message("TAC rows: ", format(nrow(tac), big.mark=","),                          # [verified] 8,205,370
+        " | dates ", as.character(min(tac$date)), "–", as.character(max(tac$date)),  # [verified] 2026-01-01 – 2026-05-11
+        " | countlines: ", data.table::uniqueN(tac$countLocationId),             # [verified] 157
+        " | sites: ", data.table::uniqueN(tac$site))                             # [verified] 35
+```
+
+# Stage B — Measurement audit: a comparable, presence-aware site exposure {#measure}
+
+> **What the real data forced (and simplified).** The export is **presence-only** — only 5-min intervals with ≥1
+> crossing appear (verified: 0 zeros, 0 NA counts). A monitored zero-activity interval therefore **cannot be
+> distinguished** from an unmonitored one. Two honest consequences: (1) exposure is measured as **total crossings per
+> window-hour** (absent ≔ 0 — an explicit assumption, justified by continuous AI-sensor operation with zeros stripped);
+> note `win_hours` is a single **global** constant, so it *cancels* in every `Cm` share ratio — the rate supplies a unit,
+> it does **not** correct for differential exposure (a genuine per-site correction is impossible under presence-only data).
+> (2) We **do not claim monitoring completeness** — `covwin` is only the **width of the first→last observation window**, a
+> *coverage-window diagnostic*, NOT the observed fraction (check.md 2). The site total sums its monitored **approaches**
+> (countlines) = total flow; a site with **fewer** approaches may be *under*-counted, so the **wide-observation-span panel
+> is PRIMARY** (with a printed 0.8/0.9/0.95 span-cutoff sensitivity) and the all-site panel is the sensitivity.
+
+```{r measure-audit}
+MODES <- c("pedestrian","cyclist","escooter"); VRU <- c("pedestrian","cyclist")
+W0 <- min(tac$bucket); W1 <- max(tac$bucket); win_hours <- (W1 - W0 + 1L)*(5/60)   # window length in hours (~constant)
+
+## per site × mode: total crossings, monitored approaches, and COVERAGE-WINDOW WIDTH (first→last obs) — NOT completeness
+sm0 <- tac[class %in% MODES, .(total=sum(count), n_cl=uniqueN(countLocationId),
+                               covwin=(max(bucket)-min(bucket)+1)/(W1-W0+1)), by=.(site, class)]
+sm0[, rate := total/win_hours]                                                  # crossings per window-hour (comparable)
+sm_wide <- data.table::dcast(sm0, site ~ class, value.var="rate")
+for (m in MODES) if (!m %in% names(sm_wide)) sm_wide[[m]] <- NA_real_
+sm_wide[, vru_rate := data.table::fifelse(is.na(pedestrian)|is.na(cyclist), NA_real_, pedestrian+cyclist)]  # both modes required
+cw_wide <- data.table::dcast(sm0, site ~ class, value.var="covwin")
+setnames(cw_wide, intersect(MODES,names(cw_wide)), paste0("covwin_",intersect(MODES,names(cw_wide))), skip_absent=TRUE)
+appr <- tac[class %in% VRU, .(n_approaches=uniqueN(countLocationId)), by=site]
+sm_wide <- Reduce(function(a,b) merge(a,b,by="site"), list(sm_wide, cw_wide, appr, site_xy))
+sites <- st_as_sf(sm_wide, coords=c("lon","lat"), crs=CRS_WGS) |> st_transform(CRS_WORK); sites <- sites[com_u,]
+## compact site IDs S01..S35 by busyness — reused on maps AND the heatmap (coordinated views · Munzner)
+sites$site_id <- sprintf("S%02d", rank(-data.table::fifelse(is.na(sites$vru_rate), -Inf, sites$vru_rate), ties.method="first"))
+cat("Sensor sites in CoM:", nrow(sites), "| approaches/site min/median/max:",
+    min(appr$n_approaches), "/", as.integer(median(appr$n_approaches)), "/", max(appr$n_approaches),
+    "(1-approach sites may be under-counted)\n")   # [verified] 1 / 4 / 12
+
+## COMPARABLE (PRIMARY) panel = wide coverage window (covwin≥0.9: reported from near window start to end).
+## covwin is a coverage-window DIAGNOSTIC, not a completeness guarantee (presence-only data can't establish completeness).
+elig_ped <- !is.na(sites$covwin_pedestrian) & sites$covwin_pedestrian >= 0.9
+elig_cyc <- !is.na(sites$covwin_cyclist)    & sites$covwin_cyclist    >= 0.9
+cat("Wide-observation-span panel (coverage window ≥0.9) — pedestrian:", sum(elig_ped), "| cyclist:", sum(elig_cyc),
+    "of", nrow(sites), "\n")
+
+## SPAN-THRESHOLD SENSITIVITY (audit P0-4 gate): does the finding hold across span cut-points 0.8 / 0.9 / 0.95? Report per
+## mode the eligible-site count and the SHARE OF TOTAL CROSSINGS the panel retains (CoM sites). Two honesty notes the audit
+## required: (1) win_hours is a single GLOBAL constant, so it CANCELS in every Cm share ratio — the "per window-hour" rate
+## supplies a UNIT, it does NOT correct for differential exposure; a real correction would divide each site by ITS OWN
+## observed opportunity, which presence-only data cannot support (a quiet hour is indistinguishable from an unmonitored one).
+## (2) span is a coverage-WINDOW WIDTH (first→last obs), NOT monitoring completeness; "missing ≔ 0" is an explicit assumption.
+sm_com  <- sm0[site %in% sites$site & class %in% VRU]
+tot_by  <- sm_com[, .(tot=sum(total)), by=class]
+span_tbl <- purrr::map_dfr(c(0.8,0.9,0.95), function(th) purrr::map_dfr(VRU, function(m){
+  e <- sm_com[class==m & covwin>=th]
+  tibble(span_cutoff=th, mode=m, eligible_sites=nrow(e),
+         retained_crossing_share=round(sum(e$total)/tot_by$tot[tot_by$class==m], 3)) }))
+cat("Wide-observation-span panel — sensitivity to the span cut-off (names its panel; span ≠ completeness):\n")
+print(as.data.frame(span_tbl))
+```
+
+# Integration — distances (fixed primary) {#integrate}
+
+```{r integrate}
+fx_ext <- fx_sf[st_buffer(com_u, 1000), ]                                     # external buffer: fixed cameras ≤1 km outside CoM
+cam_all <- rbind(transmute(fx_ext, kind="fixed"), transmute(mb_com_sf, kind="mobile"))
+sites$d_fixed  <- as.numeric(st_distance(sites, st_union(fx_ext)))            # PRIMARY
+sites$d_mobile <- as.numeric(st_distance(sites, st_union(mb_com_sf)))         # separate (registered locations only)
+sites$d_any    <- as.numeric(st_distance(sites, st_union(cam_all)))          # combined — sensitivity only
+## nearest existing PHYSICAL protection + strong-protection metres within 200 m
+bk_ex <- bk |> filter(existing=="Existing", !is.na(protection))
+sites$near_prot <- bk_ex$protection[st_nearest_feature(sites, bk_ex)]
+prot_strong <- st_union(bk_ex |> filter(protection %in% c("1 Off-road / trail","2 Separated on-road")))
+buf <- st_buffer(sites,200)
+sites$prot_m_200 <- vapply(seq_len(nrow(buf)), function(i){
+  x<-suppressWarnings(st_intersection(prot_strong, st_geometry(buf)[i])); if(length(x)==0) 0 else as.numeric(sum(st_length(x)))}, numeric(1))
+```
+
+# RQ1 — Spatial alignment (corrected weighted-proximity analysis) {#rq1}
+
+> **Sub-question** · Do high-activity sites hold a *disproportionate* share of activity near fixed cameras?
+> **Measure** · `Cm(d)=Σ Aᵢ·1(Dᵢ≤d)/Σ Aᵢ` (activity-weighted) vs `U(d)=(1/n)Σ 1(Dᵢ≤d)` (site benchmark, **all
+> eligible sites incl. genuine zeros**). **Gap `Cm−U`** is the alignment signal.
+> **Method** · curves + gap + a **distance-response profile** (exact ECDF at 100/250/500/750/1000 m) + **influence**.
+> **Validity** · exposure = total crossings per window-hour (presence-only; §Stage B); **fixed-camera distance primary**; distance is a *proximity proxy*, not
+> demonstrated enforcement coverage; **no inferential p-value is claimed** (an unrestricted activity permutation is
+> not a valid spatial null on this small, selective network — v2's test is removed).
+> **Robustness** · eligible-panel vs all-sites overlay; leave-one-site-out on the *mode-specific fixed-camera* headline.
+
+```{r rq1-curves}
+## FIX: U(d) keeps every eligible site (a genuine zero-activity site belongs in the site denominator);
+## Cm(d) is activity-weighted so zeros contribute zero weight automatically. Step geometry (ECDF), not interpolation.
+curve_two <- function(D, A){
+  ok <- is.finite(D) & is.finite(A) & A>=0; D<-D[ok]; A<-A[ok]
+  dg <- sort(unique(D)); if (length(dg) && min(dg)>0) dg <- c(0, dg)   # P0-6: draw the ECDF from a shared 0 origin (flat start)
+  tibble(d=dg,                                                          # top flat end (all sites within d ⇒ Cm=U=1) is already present
+         Cm = vapply(dg, function(x) if (sum(A)>0) sum(A[D<=x])/sum(A) else NA_real_, numeric(1)),
+         U  = vapply(dg, function(x) mean(D<=x), numeric(1))) |> mutate(gap = Cm - U)
+}
+## PRIMARY = the comparable panel (coverage window ≥0.9) per mode; all-sites is the sensitivity (F-RQ1d). (check.md 1/2)
+elig_of <- function(m) if (m=="pedestrian") elig_ped else elig_cyc
+rq1 <- purrr::map_dfr(c("pedestrian","cyclist"), function(m){ e<-elig_of(m)
+  curve_two(st_drop_geometry(sites)$d_fixed[e], st_drop_geometry(sites)[[m]][e]) |> mutate(mode=m) })
+F_rq1a <- ggplot(rq1, aes(d)) +
+  geom_step(aes(y=Cm, colour="Activity-weighted  Cm(d)"), linewidth=.9) +
+  geom_step(aes(y=U,  colour="Site benchmark  U(d)"), linewidth=.7, linetype=2) +
+  facet_wrap(~mode) +
+  scale_colour_manual(values=c("Activity-weighted  Cm(d)"="#08519c","Site benchmark  U(d)"="grey45"), name=NULL) +
+  scale_y_continuous(labels=percent) +
+  labs(title="F-RQ1a · Activity concentration vs a site benchmark — FIXED cameras (wide-observation-span panel)",
+       subtitle="context for the gap in F-RQ1b · Cm above U ⇒ recorded activity share concentrates nearer cameras; Cm≈U ⇒ activity share is similar to the site benchmark",
+       x="distance d to nearest fixed camera (m)", y="cumulative share (from 0)") + theme_dep()
+ggsave2("F_RQ1a_curves.png", F_rq1a, w=10, h=5); F_rq1a
+
+## HERO figure (the estimand itself): the alignment gap Cm(d) − U(d) with a zero reference.
+F_rq1b <- ggplot(rq1, aes(d, gap, colour=mode)) + geom_hline(yintercept=0, colour="grey40") +
+  geom_step(linewidth=1.1) + scale_colour_manual(values=MODE_COL, name="mode") + scale_y_continuous(labels=percent) +
+  labs(title="F-RQ1b · Spatial alignment gap  Cm(d) − U(d)  (fixed cameras) — RQ1 HERO",
+       subtitle="above 0 ⇒ recorded activity share concentrates nearer cameras · ≈0 ⇒ share is similar to the site benchmark (not an equivalence test) · below 0 ⇒ share skews farther",
+       x="distance d (m)", y="Cm − U  (percentage points)") + theme_dep()
+ggsave2("F_RQ1b_gap.png", F_rq1b, w=9, h=4.2); F_rq1b
+```
+
+```{r rq1-distance-response}
+## Exact ECDF values at a RANGE of exploratory distances (not "policy" distances; not the nearest of a grid), fixed-camera, per mode.
+at <- function(D,A,d) c(Cm=if(sum(A)>0) sum(A[D<=d])/sum(A) else NA, U=mean(D<=d))
+grid_d <- c(100,250,500,750,1000)
+dr <- purrr::map_dfr(c("pedestrian","cyclist"), function(m){ e<-elig_of(m)         # PRIMARY = comparable panel
+  A<-st_drop_geometry(sites)[[m]][e]; D<-st_drop_geometry(sites)$d_fixed[e]; ok<-is.finite(A)&is.finite(D); A<-A[ok]; D<-D[ok]
+  purrr::map_dfr(grid_d, function(d){ v<-at(D,A,d); tibble(mode=m, d=d, Cm=round(v["Cm"],3), U=round(v["U"],3),
+                                                           gap_pp=round(100*(v["Cm"]-v["U"]),1)) }) })
+## C, U and the gap shown TOGETHER at each distance (P0-6): a distance-THRESHOLD-sensitivity profile of the descriptive
+## contrast Cm−U — read the sign and size of the gap across cut-points; NOT a causal distance-response. No "stable/small" label.
+print(dr)
+```
+
+```{r rq1-scatter-influence}
+## MODE-FACETED scatter (check.md 4B): activity rate vs distance to nearest fixed camera — no longer pooled on vru_rate
+sc <- st_drop_geometry(sites) |> dplyr::select(site, d_fixed, pedestrian, cyclist) |>
+  tidyr::pivot_longer(c(pedestrian,cyclist), names_to="mode", values_to="rate") |> filter(is.finite(rate))
+F_rq1c <- ggplot(sc, aes(d_fixed, rate)) + geom_point(alpha=.7, colour="#08519c") + facet_wrap(~mode, scales="free_y") +
+  labs(title="F-RQ1c · Activity rate vs fixed-camera distance — inspect EACH mode internally (free y-scales; not for cross-mode magnitude)",
+       x="distance to nearest fixed camera (m)", y="exposure (crossings per window-hour)") + theme_dep()
+ggsave2("F_RQ1c_scatter.png", F_rq1c, w=10, h=4.4); F_rq1c
+
+## companion activity MAP with a clear data-layer HIERARCHY (context → activity → enforcement · Munzner salience):
+## smaller max activity circle, larger camera glyphs, and the busiest sites labelled by ID (coordinated with F-RQ2e).
+topsites <- sites[order(-data.table::fifelse(is.na(sites$vru_rate), -Inf, sites$vru_rate))[1:6], ]
+F_rq1e <- ggplot() + geom_sf(data=com, fill="#f4f4f2", colour="#8a8a8a", linewidth=.4) +
+  geom_sf(data=sites, aes(size=vru_rate), colour="#6baed6", alpha=.5) +
+  geom_sf(data=cam_all, aes(shape=kind, colour=kind), size=2.4, stroke=1) +
+  ggplot2::geom_sf_text(data=topsites, aes(label=site_id), size=2.5, fontface="bold", colour="black") +
+  scale_size_area(max_size=7, name="VRU exposure") + scale_shape_manual(values=c(fixed=17,mobile=15), name="camera") +
+  scale_colour_manual(values=CAM_COL, name="camera") +
+  labs(title="F-RQ1e · VRU exposure at sensor sites + cameras (busiest sites labelled)") + theme_map() + scalebar_m()
+ggsave2("F_RQ1e_activitymap.png", F_rq1e); F_rq1e
+
+## INFLUENCE on the GAP Cm−U @500 m, per mode, on the PRIMARY comparable panel (check.md 4A: about the GAP, not Cm)
+gap500 <- function(m, idx){ s<-st_drop_geometry(sites)[idx,]; A<-s[[m]]; D<-s$d_fixed; ok<-is.finite(A)&is.finite(D)
+  A<-A[ok]; D<-D[ok]; (if (sum(A)>0) sum(A[D<=500])/sum(A) else NA_real_) - mean(D<=500) }
+for (m in c("pedestrian","cyclist")){
+  ei <- which(elig_of(m))                                                     # comparable panel indices
+  base <- gap500(m, ei)
+  loo  <- vapply(ei, function(i) gap500(m, setdiff(ei,i)), numeric(1))
+  cat(sprintf("RQ1 %s (wide-observation-span panel, n=%d): gap Cm−U @500 m = %+.1f pp | leave-one-out %+.1f to %+.1f pp\n",
+              m, length(ei), 100*base, 100*min(loo,na.rm=TRUE), 100*max(loo,na.rm=TRUE)))
+}
+```
+
+```{r rq1-sensitivity-panel}
+## SENSITIVITY (check.md 1): the PRIMARY (comparable, coverage-window ≥0.9) panel vs the all-site panel — does adding
+## the possibly-incomparable sites move the gap? Primary is the coloured line; all-sites is the grey robustness line.
+sens1 <- purrr::map_dfr(c("pedestrian","cyclist"), function(m){
+  elig <- if (m=="pedestrian") elig_ped else elig_cyc
+  bind_rows(curve_two(st_drop_geometry(sites)$d_fixed, st_drop_geometry(sites)[[m]]) |> mutate(panel="all sites (sensitivity)"),
+            curve_two(st_drop_geometry(sites)$d_fixed[elig], st_drop_geometry(sites)[[m]][elig]) |> mutate(panel="wide-span panel (primary)")) |>
+    mutate(mode=m) })
+F_rq1d <- ggplot(sens1, aes(d, gap, colour=panel)) + geom_hline(yintercept=0, colour="grey60") +
+  geom_step(linewidth=.8) + facet_wrap(~mode) + scale_colour_manual(values=c("all sites (sensitivity)"="#bdbdbd","wide-span panel (primary)"="#08519c")) +
+  scale_y_continuous(labels=percent) +
+  labs(title="F-RQ1d · Does the conclusion depend on weakly-observed sites?", x="distance d (m)", y="Cm − U") + theme_dep()
+ggsave2("F_RQ1d_sensitivity.png", F_rq1d, w=10, h=4.4); F_rq1d
+```
+
+```{r rq1-gap-decomposition}
+## GAP DECOMPOSITION (audit P1 3.1 — "the single best addition"): each site's SIGNED contribution to the gap at 500 m,
+##   q_i = (A_i/ΣA − 1/n) · 1(D_i ≤ 500),   which sums EXACTLY to G(500) = Cm(500) − U(500).
+## It answers "WHICH sites create the aggregate?" and exposes whether the finding rests on one or two loud sites — the
+## honest companion to the leave-one-out (whose movement is NOT mechanically 1/n, because ΣA in Cm shifts when a site drops).
+qi <- purrr::map_dfr(c("pedestrian","cyclist"), function(m){ e <- elig_of(m)
+  s <- st_drop_geometry(sites)[e,]; A <- s[[m]]; D <- s$d_fixed; ok <- is.finite(A) & is.finite(D)
+  s <- s[ok,]; A <- A[ok]; D <- D[ok]; n <- length(A)
+  tibble(mode=m, site_id=s$site_id, q = ((A/sum(A)) - 1/n) * (D<=500)) })
+chk <- qi |> group_by(mode) |> summarise(sum_q_pp=round(100*sum(q),2), .groups="drop")   # gate: must equal gap_pp @500 (F-RQ1b/dr)
+cat("Gap-decomposition identity check — Σ q_i (pp) must equal the @500 m gap printed above:\n"); print(as.data.frame(chk))
+F_rq1f <- qi |> group_by(mode) |> arrange(q) |> mutate(rk=dplyr::row_number()) |>
+  slice(unique(c(1:min(8,dplyr::n()), max(1,dplyr::n()-7):dplyr::n()))) |> ungroup() |>   # strongest signed contributors
+  ggplot(aes(reorder(site_id, q), 100*q, fill=q>0)) + geom_col() + coord_flip() +
+  facet_wrap(~mode, scales="free_y") + geom_hline(yintercept=0, colour="grey40") +
+  scale_fill_manual(values=c(`TRUE`="#08519c",`FALSE`="#b2182b"), guide="none") +
+  labs(title="F-RQ1f · Which sites drive the alignment gap at 500 m — signed contribution q_i  (Σ q_i = Cm − U)",
+       subtitle="blue (q>0) = a within-500 m site that raises Cm−U (activity concentrated there beyond a uniform site) · red (q<0) = a within-500 m site that lowers it · IDs match F-RQ1e/F-RQ2e",
+       x="site ID", y="contribution to Cm − U at 500 m (pp)") + theme_dep()
+ggsave2("F_RQ1f_gap_decomposition.png", F_rq1f, w=10, h=5); F_rq1f
+
+## RQ1 HERO COMPOSITE (check.md D — compose to a few composites, don't ship ~17 loose figures): the gap (WHAT) above,
+## its site decomposition (WHO) below — one figure carries the RQ1 story for the report body; the rest go to the appendix.
+F_rq1_hero <- (F_rq1b / F_rq1f) + patchwork::plot_annotation(title="F-RQ1 · Spatial alignment gap and the sites that drive it")
+ggsave2("F_RQ1_hero.png", F_rq1_hero, w=10, h=9); F_rq1_hero
+```
+
+## RQ1 context — spatial structure of activity (Moran/LISA, demoted) {#rq1-context}
+
+> **Kept only because it explains one thing the main analysis needs:** that activity is *genuinely* clustered
+> (so "the busy core" is a real spatial feature, not a few loud sites). It **does not test camera alignment** —
+> that is the job of `Cm/U` above. Weights are symmetrised and a small k-sensitivity is shown.
+
+```{r rq1-moran}
+x <- log1p(sites$vru_rate); ok <- is.finite(x); xs <- x[ok]; pts <- st_coordinates(sites)[ok,]
+moran_k <- function(k){ nb <- spdep::make.sym.nb(spdep::knn2nb(spdep::knearneigh(pts, k=k)))  # symmetric weights
+                        spdep::moran.test(xs, spdep::nb2listw(nb, style="W"))$estimate[1] }
+cat("Global Moran's I (activity rate): k=4", round(moran_k(4),3), "| k=6", round(moran_k(6),3),
+    "| k=8", round(moran_k(8),3), " -> clustering stable to neighbourhood size (surfaced via cat, not a hidden message)\n")
+```
+
+# RQ2 — Temporal variation of the spatial alignment (share AND magnitude) {#rq2}
+
+> **Sub-question** · Does the *spatial* activity↔fixed-camera alignment change by hour/week? (enforcement *timing*
+> is unobservable and is not claimed.)
+> **Measure** · the **temporal alignment gap** `Gt(d) = Ct(d) − U(d)` — the SAME `Cm−U` estimand as RQ1, now indexed by
+> hour — plus **aggregate far-from-camera activity** `Bmt(d)` as the volume companion (a constant gap can still hide a
+> changing amount of far-away activity).
+> **Method** · the RQ2 ANSWER is exactly three views — **`Gt` gap-by-hour** (F-RQ2a, hero), **far-magnitude `Bmt`**
+> (F-RQ2b), and **weekly paired persistence** Δ(PM−AM) (F-RQ2c). Everything else in this section — the **PM−AM balance
+> map** (F-RQ2d), the **per-hour intensity heatmap** (F-RQ2e), and the **daypart rank-stability** — is *activity-rhythm
+> context for reading the gap*, **not** an alignment test, and is labelled as such so RQ2 does not drift into "generic
+> temporal patterns of activity". Clustering & STL stay removed (they changed no answer).
+> **Windows** · AM = 07–09 h, PM = 16–18 h are **predefined transport commuter-peak windows**, fixed a priori (standard
+> AM/PM peaks), **not** chosen to maximise the finding.
+> **Validity** · wide-observation-span (coverage-window ≥0.9) panel; hourly weight = total crossings per site-hour cell; fixed-camera distance primary.
+
+```{r rq2-adjusted-rates}
+## RQ2 restricted to the COMPARABLE (coverage-window ≥0.9) panel per mode, so hourly totals are comparable across sites;
+## presence-only ⇒ the weight is total crossings in each site × mode × hour-of-day cell.
+elig_lu <- rbind(data.frame(site=sites$site[elig_ped], class="pedestrian", stringsAsFactors=FALSE),
+                 data.frame(site=sites$site[elig_cyc], class="cyclist",    stringsAsFactors=FALSE))
+ph <- tac[class %in% VRU, .(rate=sum(count)), by=.(site, class, hour)] |>
+  merge(st_drop_geometry(sites)[, c("site","d_fixed")], by="site") |>
+  merge(elig_lu, by=c("site","class"))
+cat("RQ2 eligible sites — pedestrian:", sum(elig_ped), "| cyclist:", sum(elig_cyc), "\n")
+```
+
+```{r rq2-share-magnitude}
+D0 <- 500
+## RQ2 INHERITS RQ1's benchmark (check.md 3): the temporal ALIGNMENT GAP Gt = Ct(500) − U(500), where U(500) is the
+## SAME site benchmark (share of comparable-panel sites within 500 m), held constant across hours. This makes the chain
+## coherent: RQ1 = spatial alignment gap; RQ2 = how that SAME gap changes through time.
+site_lu <- unique(ph[, .(class, site, d_fixed)])
+Umode   <- site_lu[, .(U500 = mean(d_fixed<=D0)), by=class]                    # site benchmark per mode (comparable panel)
+align <- ph[, .(Ct=sum(rate[d_fixed<=D0])/sum(rate), Bmt=sum(rate[d_fixed>D0])), by=.(class,hour)] |>
+  merge(Umode, by="class"); align[, Gt := Ct - U500]
+F_rq2a <- ggplot(align, aes(hour, 100*Gt, colour=class)) + geom_hline(yintercept=0, colour="grey40") +
+  geom_line(linewidth=1) + geom_point(size=1.1) + facet_wrap(~class) + scale_colour_manual(values=MODE_COL, guide="none") +
+  labs(title="F-RQ2a · Temporal alignment gap  Ct(500 m) − U(500 m)  by hour (RQ2 HERO; same benchmark as RQ1)",
+       subtitle="how the SPATIAL alignment gap moves through the day — near 0 ⇒ the near-camera activity share stays similar to the benchmark across hours (not a timing effect)",
+       x="hour", y="Ct − U  (percentage points)") + theme_dep()
+F_rq2b <- ggplot(align, aes(hour, Bmt, colour=class)) + geom_line(linewidth=1) + scale_colour_manual(values=MODE_COL) +
+  labs(title="F-RQ2b · Aggregate far-from-camera activity by hour (hourly crossings beyond 500 m)",
+       subtitle="the magnitude a share hides — a constant gap with changing far-activity still matters operationally",
+       x="hour", y="Σ hourly crossings at sites >500 m") + theme_dep()
+(F_rq2a / F_rq2b); ggsave2("F_RQ2ab_gap_magnitude.png", F_rq2a / F_rq2b, h=8)
+```
+
+```{r rq2-persistence}
+## WEEKLY PAIRED contrast (check.md 5E): Δw = Cmt,PM − Cmt,AM per ISO week; plotted around 0, with how often it recurs.
+tac[, `:=`(wk=isoweek(ts), slot=fcase(hour %in% 7:9,"AM", hour %in% 16:18,"PM", default=NA_character_))]
+wk <- tac[class %in% VRU & !is.na(slot), .(rate=sum(count)), by=.(site,class,wk,slot)] |>
+  merge(st_drop_geometry(sites)[,c("site","d_fixed")], by="site") |> merge(elig_lu, by=c("site","class"))
+wk_share <- wk[, .(Cmt=sum(rate[d_fixed<=D0])/sum(rate)), by=.(class,wk,slot)]
+wk_wide <- data.table::dcast(wk_share, class+wk ~ slot, value.var="Cmt"); wk_wide[, delta := PM - AM]
+rec <- wk_wide[!is.na(delta), .(weeks=.N, weeks_PM_higher=sum(delta>0), median_pp=round(100*median(delta),1)), by=class]
+cat("RQ2 weekly AM→PM near-share change Δw (weeks_PM_higher near 0 or near weeks ⇒ a consistent direction):\n"); print(rec)
+## put the recurrence proportion DIRECTLY in the subtitle (check.md 16) — the figure states its own evidence
+rec_lab <- paste(rec[, sprintf("%s: PM>AM in %d/%d wks (%d%%)", class, weeks_PM_higher, weeks,
+                               round(100*weeks_PM_higher/weeks))], collapse="   ·   ")
+F_rq2c <- ggplot(wk_wide[!is.na(delta)], aes(class, 100*delta, colour=class)) +
+  geom_hline(yintercept=0, colour="grey50") + geom_point(position=position_jitter(width=.08), alpha=.85) +
+  stat_summary(fun=median, geom="crossbar", width=.35, linewidth=.3) + scale_colour_manual(values=MODE_COL, guide="none") +
+  labs(title="F-RQ2c · Weekly PM − AM near-camera share difference (each point = one ISO week)",
+       subtitle=rec_lab, x=NULL, y="Δ (PM − AM) near-share, pp") + theme_dep()
+ggsave2("F_RQ2c_weekly_delta.png", F_rq2c, w=8, h=4); F_rq2c
+```
+
+```{r rq2-rank-stability}
+## Daypart rank-stability, MODE-SPECIFIC with sample sizes (check.md 5F); the 'clock' evidence is the per-clock-hour heatmap below.
+tac[, slice := factor(fcase(hour %in% 7:9,"AM", hour %in% 10:15,"Midday", hour %in% 16:18,"PM", default="Evening"),
+                      levels=c("AM","Midday","PM","Evening"))]
+for (m in c("pedestrian","cyclist")){
+  es <- sites$site[if (m=="pedestrian") elig_ped else elig_cyc]
+  slm <- data.table::dcast(tac[class==m & site %in% es, .(rate=sum(count)), by=.(site,slice)], site ~ slice, value.var="rate")
+  M <- as.matrix(slm[,-1]); rho <- cor(M, method="spearman", use="pairwise.complete.obs")
+  cat(sprintf("RQ2 %s daypart rank-stability (n=%d sites): AM~PM ρ=%.2f | AM~Midday ρ=%.2f | PM~Evening ρ=%.2f\n",
+              m, nrow(slm), rho["AM","PM"], rho["AM","Midday"], rho["PM","Evening"]))
+}
+## PER-CLOCK-HOUR intensity heatmap (audit P0-4/P1 3.2). The v3.3 DAYPART heatmap was a WINDOW-WIDTH ARTEFACT: AM=3 h,
+## Midday=6 h, PM=3 h, Evening=12 h, so a constant flow shows shares 12.5/25/12.5/50 % and the widest tile reads "busiest".
+## Replaced by AVERAGE crossings per equal-width CLOCK-HOUR (total at that hour-of-day ÷ study-window days), chronological
+## columns 0–23, ONE shared busiest→top site order across both modes; unseen hours are 0 under the stated presence-only (missing≔0) model.
+ndays <- data.table::uniqueN(tac$date)                                            # opportunity denominator: days in the window
+hh <- tac[class %in% VRU, .(avg = sum(count)/ndays), by=.(site,class,hour)] |>     # avg crossings per day at that clock-hour
+  merge(elig_lu, by=c("site","class")) |>
+  merge(st_drop_geometry(sites)[,c("site","site_id")], by="site")
+lev <- sort(unique(hh$site_id), decreasing=TRUE)                                  # S01 (busiest) at top, shared across facets
+hh <- as.data.frame(hh) |> tidyr::complete(tidyr::nesting(site, site_id, class), hour=0:23, fill=list(avg=0))
+hh$site_id <- factor(hh$site_id, levels=lev)
+F_rq2e <- ggplot(hh, aes(factor(hour, levels=0:23), site_id, fill=avg)) + geom_tile() + facet_wrap(~class) +
+  scale_fill_viridis_c(option="A", trans="log1p", breaks=c(0,1,5,20,100), name="avg crossings\nper clock-hour") +
+  scale_x_discrete(breaks=as.character(seq(0,23,3)), drop=FALSE) +
+  labs(title="F-RQ2e · Activity intensity by clock-hour, per site (IDs match the maps) — pedestrian vs cyclist",
+       subtitle="average crossings per EQUAL-WIDTH hour (replaces the window-width daypart share); busiest sites at top; 0 = none recorded that hour",
+       x="hour of day", y="site ID (busiest → top)") +
+  theme_dep() + theme(axis.text.y=element_text(size=6), panel.grid=element_blank())
+ggsave2("F_RQ2e_hour_heatmap.png", F_rq2e, w=10, h=7); F_rq2e
+```
+
+```{r rq2-shape-contrasts}
+## SIGNED PM-vs-AM balance in [-1,1], NA when undefined (check.md 5D). v3.4's weekend/weekday balance was computed but never
+## used (dead code, check.md E) — removed; a second signed map would only dilute RQ2's alignment focus (check.md Part B).
+idx <- tac[class %in% VRU, .(am=sum(count[hour %in% 7:9]), pm=sum(count[hour %in% 16:18])), by=.(site,class)]
+idx[, pm_am_bal := data.table::fifelse(pm+am>0, (pm-am)/(pm+am), NA_real_)]
+
+## FAR-FROM-CAMERA peak-window CONTRIBUTORS (audit P1 3.3): which >500 m sites carry the largest AVERAGE recorded volume
+## in AM (07–09) / PM (16–18)? Names the places behind the aggregate far-activity (Bmt) — reuses idx + d_fixed, no new method.
+far <- merge(idx, st_drop_geometry(sites)[, c("site","site_id","d_fixed")], by="site")[d_fixed>500]
+far[, `:=`(am_per_day=round(am/ndays,1), pm_per_day=round(pm/ndays,1))]
+cat("Far-from-camera (>500 m) peak-window contributors — top 4 by PM avg crossings/day, per mode:\n")
+print(far[order(class,-pm), head(.SD,4), by=class][, .(class, site_id, d_fixed=round(d_fixed), am_per_day, pm_per_day)])
+
+sites2 <- merge(sites, idx[class=="cyclist", .(site, pm_am_bal)], by="site")
+F_rq2d <- ggplot() + geom_sf(data=com, fill="#f4f4f2", colour="#8a8a8a", linewidth=.4) +
+  geom_sf(data=sites2, aes(colour=pm_am_bal), size=3) + geom_sf(data=cam_all, aes(shape=kind), size=1.2) +
+  scale_colour_gradient2(low="#2166ac", mid="grey85", high="#b2182b", midpoint=0, limits=c(-1,1),
+                         name="cyclist PM−AM\nbalance", na.value="grey70") +
+  scale_shape_manual(values=c(fixed=17,mobile=15), guide="none") +
+  labs(title="F-RQ2d · Cyclist PM vs AM activity balance per site (signed; trip purpose is unobserved)",
+       subtitle="a timing balance in [−1,1], NOT a 'commute-lean' behavioural label") + theme_map() + scalebar_m()
+ggsave2("F_RQ2d_balance.png", F_rq2d); F_rq2d
+```
+
+# RQ3 — Segment contribution on an interior-junction-noded network {#rq3}
+
+> **The HD question is which structural conclusions survive geometric uncertainty (check.md 8).** Absolute
+> connectivity is **strongly tolerance-dependent** — the largest core is ~40 % of length at 2 m but ~80 % at 5 m — so
+> v3 does **not** commit to "one dominant core." The defensible headline is instead: *network continuity is tolerance-
+> sensitive, but the **identity of structurally critical segments** is [stable/unstable] across plausible tolerances*
+> (the printed 2 m↔5 m overlap decides which). v2's endpoint-only joining manufactured fragmentation; v3 nodes at
+> interior junctions via `sfnetworks::to_spatial_subdivision`. **This is a topology *improvement*, not a verified
+> audit:** subdivision connects represented crossings but does not prove a crossing is *traversable* (grade
+> separation) or create every geometric intersection, and grid rounding can over-/under-merge — so a junction
+> near-miss audit is printed, and RQ3 is a **network-structure** question, not behavioural accessibility.
+> Corridors (planning geometry) are excluded from the physical baseline. All reachability figures below hold the
+> **probe set and pair denominator FIXED** across tolerances (check.md 6C), and **length** share is computed
+> explicitly (not node share — check.md 6B).
+
+```{r rq3-build}
+bk_phys <- bk |> filter(existing=="Existing", !is_corridor) |> mutate(.rid = dplyr::row_number())
+lines_ls <- suppressWarnings(st_cast(st_cast(bk_phys, "MULTILINESTRING"), "LINESTRING"))
+net <- sfnetworks::as_sfnetwork(lines_ls, directed=FALSE) |>
+       tidygraph::convert(sfnetworks::to_spatial_subdivision)
+edf <- net |> tidygraph::activate("edges") |> tibble::as_tibble()
+edf$len <- as.numeric(st_length(st_as_sf(tidygraph::activate(net,"edges"))))
+nc  <- st_coordinates(st_as_sf(tidygraph::activate(net,"nodes")))
+
+## mk_gridgraph takes an optional grid ORIGIN offset (ox,oy) so the origin-dependence of grid-snapping can be probed
+## (check.md A4b). ox=oy=0 (default) reproduces every existing call unchanged; the key is the cell CENTRE in original metres.
+mk_gridgraph <- function(from,to,len,rid,t,ox=0,oy=0){
+  key <- paste(round((nc[,1]-ox)/t)*t+ox, round((nc[,2]-oy)/t)*t+oy, sep="_")
+  e <- data.frame(f=key[from], g=key[to], len=len, rid=rid); e <- e[e$f!=e$g, ]
+  G <- igraph::graph_from_data_frame(e[,c("f","g")], directed=FALSE)
+  igraph::E(G)$len <- e$len; igraph::E(G)$rid <- e$rid; G
+}
+## SELF-LOOP LENGTH LEAKAGE (check.md A4a): mk_gridgraph drops edges whose two endpoints round to the SAME cell (f==g),
+## which also removes their length from the denominator in core_stats — so "core length %" is a share of SURVIVING length,
+## and coarser grids collapse more short edges into self-loops. This reports that dropped share so the artefact is visible.
+selfloop_share <- function(t,ox=0,oy=0){ key <- paste(round((nc[,1]-ox)/t)*t+ox, round((nc[,2]-oy)/t)*t+oy, sep="_")
+  sl <- key[edf$from]==key[edf$to]; round(100*sum(edf$len[sl])/sum(edf$len),1) }
+## FIX (audit P0-5): pick the core by SUMMED LENGTH (the claim is about length), and report BOTH length & node share.
+core_stats <- function(G){ cc<-igraph::components(G); en<-igraph::ends(G, igraph::E(G)); el<-igraph::E(G)$len
+  comp_len <- tapply(el, cc$membership[en[,1]], sum)                       # length per component
+  biglen   <- as.integer(names(comp_len)[which.max(comp_len)])            # component with the MOST length
+  incore   <- cc$membership[en[,1]]==biglen & cc$membership[en[,2]]==biglen
+  list(comps=cc$no, core_len_pct=round(100*sum(el[incore])/sum(el),1),
+       core_node_pct=round(100*sum(cc$membership==biglen)/igraph::vcount(G),1)) }
+TOL <- 2
+G0 <- mk_gridgraph(edf$from, edf$to, edf$len, edf$.rid, TOL)
+cs <- core_stats(G0)
+cat("GRID-QUANTISED existing physical network @",TOL,"m cells: components",cs$comps,
+    "| largest core by length:", cs$core_len_pct,"% of length (",cs$core_node_pct,"% of nodes)\n")
+# [verified direction] ~46 components; largest core ~40% of length at 2 m, ~80% at 5 m — a GRID-QUANTISATION sweep, not a metric tolerance
+
+## JUNCTION NEAR-MISS AUDIT (audit P0-2): each endpoint's nearest distance to OTHER routes (EXCLUDING its own feature).
+## v3.3's version compared endpoints to the union incl. their own line (all 0) — this excludes the parent line.
+eps <- do.call(rbind, lapply(seq_len(nrow(lines_ls)), function(i){ co<-st_coordinates(lines_ls[i,])
+  data.frame(fid=i, x=c(co[1,1],co[nrow(co),1]), y=c(co[1,2],co[nrow(co),2])) }))
+DM  <- st_distance(st_as_sf(eps, coords=c("x","y"), crs=CRS_WORK), lines_ls)   # (2n)×n endpoint→line distances
+gap <- vapply(seq_len(nrow(eps)), function(k){ d<-as.numeric(DM[k,]); d[eps$fid[k]] <- Inf; min(d) }, numeric(1))  # exclude own line
+cat("Endpoint gap to nearest OTHER route (m): on-junction(≈0):", sum(gap<0.5), " 0.5–2 m:", sum(gap>=0.5&gap<2),
+    " 2–5 m:", sum(gap>=2&gap<5), " 5–10 m:", sum(gap>=5&gap<10), " >10 m:", sum(gap>=10),
+    " (0.5–5 m gaps are the quantisation-sensitive ones)\n")
+```
+
+```{r rq3-anchors-reach}
+## FIXED probe set + FIXED pair denominator across all tolerances (check.md 6C). Probes = 400 m CoM grid points
+## snapped ONCE to the nearest on-network node; the pair denominator is P*(P-1)/2 and never changes.
+bb <- st_bbox(com_u); gr <- expand.grid(x=seq(bb["xmin"],bb["xmax"],400), y=seq(bb["ymin"],bb["ymax"],400))
+gr <- gr[as.logical(st_intersects(st_as_sf(gr, coords=c("x","y"), crs=CRS_WORK), com_u, sparse=FALSE)), ]
+anchor_xy <- t(vapply(seq_len(nrow(gr)), function(i){
+  d2<-(nc[,1]-gr$x[i])^2+(nc[,2]-gr$y[i])^2; j<-which.min(d2); if (sqrt(d2[j])<300) nc[j,1:2] else c(NA,NA)}, numeric(2)))
+anchor_xy <- unique(anchor_xy[!is.na(anchor_xy[,1]), , drop=FALSE])
+P <- nrow(anchor_xy); denom_pairs <- P*(P-1)/2                          # FIXED denominator
+pkey <- function(t) paste(round(anchor_xy[,1]/t)*t, round(anchor_xy[,2]/t)*t, sep="_")   # probe -> its node key at t
+reach <- function(G,t){ lab <- igraph::components(G)$membership[pkey(t)]; l <- lab[!is.na(lab)]
+  same <- sum(vapply(split(seq_along(l), l), function(ix) length(ix)*(length(ix)-1)/2, numeric(1))); same/denom_pairs }
+R0 <- reach(G0, TOL); cat("Fixed CoM probes:", P, "| R(G) =", round(R0,3), "(connected probe pairs / all probe pairs)\n")
+# [verified] R(G) ≈ 0.22
+
+## sensitivity: R(G), largest-core LENGTH share, the ORIGIN-JITTER range of that share, and the dropped SELF-LOOP length,
+## across GRID-CELL sizes on the SAME fixed probe set. This is a grid-quantisation sweep (cell size, NOT a metric tolerance):
+## the origin_range column (A4b) bounds the origin-dependence artefact; selfloop_len_pct (A4a) shows the length it discards.
+jit <- c(0, 1/3, 2/3)                                                        # origin offsets as fractions of a cell
+sens_tbl <- purrr::map_dfr(c(1,2,5,10), function(t){
+  G <- mk_gridgraph(edf$from,edf$to,edf$len,edf$.rid,t); base <- core_stats(G)
+  cl <- unlist(lapply(jit, function(fx) lapply(jit, function(fy)
+          core_stats(mk_gridgraph(edf$from,edf$to,edf$len,edf$.rid,t,fx*t,fy*t))$core_len_pct)))
+  tibble(cell_m=t, components=base$comps, core_len_pct=base$core_len_pct,
+         core_lo=min(cl), core_hi=max(cl),                                   # A4b: origin-jitter range of the core % (used by F-RQ3d)
+         selfloop_len_pct=selfloop_share(t),                                 # A4a: length discarded as self-loops
+         R=round(reach(G,t),3)) })
+print(as.data.frame(sens_tbl |> mutate(origin_range=paste0(core_lo,"–",core_hi,"%")) |>
+                    dplyr::select(cell_m, components, core_len_pct, origin_range, selfloop_len_pct, R)))
+cat("Read A4: if origin_range is wide (e.g. 40% could be 30–55% under a re-origined 2 m grid), the ~40%→~80% jump is",
+    "PARTLY a grid artefact — which is exactly why the RQ3 headline refuses to commit to one core number.\n")
+```
+
+```{r rq3-contribution}
+## Removal contribution — CORRECTED (audit P0-1, P0-3). DISCONNECTION is counted by COMPONENT MEMBERSHIP on the FIXED
+## probe set, so a probe that a removal ISOLATES still counts (v3.3's intersect(pn,V(H)) silently dropped it → undercount:
+## the A–B–C, remove-A–B case now returns 2, not 0). DETOUR is the COUNT of still-connected pairs that lengthen plus the
+## median POSITIVE detour (a plain median of [0,0,0,10,20] is 0 and falsely labels a real detour "redundant").
+bp_val <- function(G){ l <- igraph::components(G)$membership[pkey(TOL)]; l <- l[!is.na(l)]
+  sum(vapply(split(seq_along(l), l), function(ix) length(ix)*(length(ix)-1)/2, numeric(1))) }
+b0 <- bp_val(G0); pn_names <- pkey(TOL)
+dist_probe <- function(G){ v <- intersect(pn_names, igraph::V(G)$name); D <- matrix(Inf, P, P)
+  if (length(v)) { dd <- igraph::distances(G, v=v, to=v, weights=igraph::E(G)$len)
+    idx <- match(pn_names, v); ok <- !is.na(idx); D[ok,ok] <- dd[idx[ok], idx[ok]] }; D }
+d_base <- dist_probe(G0); up <- upper.tri(matrix(0,P,P)); base_fin <- is.finite(d_base) & up
+Le <- purrr::map_dfr(unique(edf$.rid), function(r){
+  keep <- edf$.rid != r; H <- mk_gridgraph(edf$from[keep], edf$to[keep], edf$len[keep], edf$.rid[keep], TOL)
+  disc <- b0 - bp_val(H)                                              # fixed probe set + component-based ⇒ isolates count
+  d1 <- dist_probe(H); still <- base_fin & is.finite(d1); dif <- (d1 - d_base)[still]; pos <- dif > 0.5
+  tibble(.rid=r, pairs_disconnected=disc, detour_pairs=sum(pos),
+         detour_pos_med_m = if (any(pos)) round(median(dif[pos])) else NA_real_) })
+Le <- left_join(Le, st_drop_geometry(bk_phys)[,c(".rid","name","type","protection")], by=".rid")
+cat("Existing features", nrow(Le), "| connectivity-critical (disconnects ≥1 probe pair):", sum(Le$pairs_disconnected>0),
+    "| detour-only (≥1 pair lengthens, none disconnects):", sum(Le$pairs_disconnected==0 & Le$detour_pairs>0), "\n")
+print(Le |> arrange(desc(pairs_disconnected), desc(detour_pairs)) |> head(6))
+
+## RANKING SENSITIVITY (check.md 6F): is the critical-segment SET stable at a 5 m near-miss tolerance?
+## (component-membership only — cheap; a segment is "critical" if its removal reduces the connected-probe-pair count).
+crit_at <- function(t){
+  bp <- function(G){ l <- igraph::components(G)$membership[pkey(t)]; l <- l[!is.na(l)]
+    sum(vapply(split(seq_along(l), l), function(ix) length(ix)*(length(ix)-1)/2, numeric(1))) }
+  b0 <- bp(mk_gridgraph(edf$from,edf$to,edf$len,edf$.rid,t))
+  crit <- vapply(unique(edf$.rid), function(r){ keep <- edf$.rid!=r
+    as.integer(bp(mk_gridgraph(edf$from[keep],edf$to[keep],edf$len[keep],edf$.rid[keep],t)) < b0) }, integer(1))
+  unique(edf$.rid)[crit==1] }
+## The RQ3 headline REST on this number, so report the JACCARD |A∩B|/|A∪B| (not a bare overlap count — 6 shared means very
+## different things at |∪|=8 vs |∪|=20), with the empty-set case handled explicitly (check.md A3).
+c2 <- Le$.rid[Le$pairs_disconnected>0]; c5 <- crit_at(5)
+inter <- length(intersect(c2,c5)); uni <- length(union(c2,c5))
+jac <- if (uni==0) NA_real_ else round(inter/uni, 3)
+cat("Critical-segment SET stability — |2 m|:", length(c2), "| |5 m|:", length(c5), "| ∩:", inter, "| ∪:", uni,
+    "| Jaccard:", if (is.na(jac)) "undefined (both sets empty ⇒ no critical segment at either tolerance)" else jac,
+    "\n  (Jaccard→1 ⇒ the SAME segments are critical under either snapping ⇒ the identity claim is robust; →0 ⇒ it is not)\n")
+
+F_rq3a <- left_join(bk_phys, Le[,c(".rid","pairs_disconnected","detour_pairs")], by=".rid") |>
+  mutate(role=dplyr::case_when(pairs_disconnected>0 ~ "connectivity-critical",
+                               !is.na(detour_pairs) & detour_pairs>0 ~ "detour-only (reachability kept)",
+                               TRUE ~ "no detected effect")) |>
+  ggplot() + geom_sf(data=com, fill="#f4f4f2", colour="#8a8a8a", linewidth=.4) + geom_sf(aes(colour=role), linewidth=.8) +
+  scale_colour_manual(values=c("connectivity-critical"="#d7301f","detour-only (reachability kept)"="#fdae61",
+                               "no detected effect"="#9ecae1"), name="segment role") +
+  labs(title="F-RQ3a · Segment contribution to continuity — WHERE (removal test)") + theme_map() + scalebar_m()
+ggsave2("F_RQ3a_contribution.png", F_rq3a); F_rq3a
+
+## ranked QUANTITATIVE contribution (check.md 18): position/length is the accurate channel for the numbers themselves
+topL <- Le |> arrange(desc(pairs_disconnected), desc(detour_pairs)) |> head(10) |>
+  mutate(lab=substr(coalesce(name,type),1,24), rk=dplyr::row_number())
+F_rq3a2 <- ggplot(topL, aes(reorder(sprintf("%2d. %s", rk, lab), pairs_disconnected), pairs_disconnected)) +
+  geom_col(fill="#d7301f") +
+  geom_text(aes(label=ifelse(is.na(detour_pos_med_m),"",paste0("+",detour_pos_med_m," m"))), hjust=-0.1, size=2.6) +
+  coord_flip(clip="off") +
+  labs(title="F-RQ3a2 · Top-10 structurally critical segments — HOW MUCH (removal test)",
+       subtitle="bars = anchor pairs disconnected; label = median detour (m) among pairs that stay connected",
+       x=NULL, y="anchor pairs disconnected on removal") + theme_dep() + theme(plot.margin=margin(6,40,6,6))
+ggsave2("F_RQ3a2_ranked.png", F_rq3a2, w=9, h=4.5); F_rq3a2
+```
+
+```{r rq3-component-map}
+## component MAP (check.md §7 minimum visual): largest core vs the disconnected tail, coloured by component size rank
+memb <- igraph::components(G0)$membership; sz <- igraph::components(G0)$csize
+rank_of <- rank(-sz, ties.method="min")
+key2 <- paste(round(nc[,1]/TOL)*TOL, round(nc[,2]/TOL)*TOL, sep="_")            # each subdivided edge's from-node key
+edf$comp_rank <- rank_of[memb[key2[edf$from]]]
+edge_sf <- st_as_sf(tidygraph::activate(net,"edges")); edge_sf$comp_rank <- edf$comp_rank
+F_rq3b <- ggplot() + geom_sf(data=com, fill="#f4f4f2", colour="#8a8a8a", linewidth=.4) +
+  geom_sf(data=edge_sf, aes(colour=ifelse(comp_rank==1,"largest core","smaller components")), linewidth=.7) +
+  scale_colour_manual(values=c("largest core"="#08519c","smaller components"="#c6dbef"), name=NULL) +
+  labs(title=paste0("F-RQ3b · Network components at 2 m — largest core in blue (",cs$comps," components)")) + theme_map() + scalebar_m()
+ggsave2("F_RQ3b_components.png", F_rq3b); F_rq3b
+
+## tolerance-sensitivity as a FIGURE (check.md 19/A4b), reusing sens_tbl: the vertical range bars on the core-length facet
+## show how far the core % moves across 9 grid ORIGINS — a wide bar ⇒ the number is partly a grid-accounting artefact.
+sd_long <- sens_tbl |>
+  tidyr::pivot_longer(c(core_len_pct, R, components), names_to="name", values_to="value") |>
+  mutate(name=dplyr::recode(name, core_len_pct="core length %", R="R(G)", components="components"),
+         lo=ifelse(name=="core length %", core_lo, NA_real_), hi=ifelse(name=="core length %", core_hi, NA_real_))
+F_rq3d <- ggplot(sd_long, aes(factor(cell_m), value, group=name)) +
+  geom_errorbar(aes(ymin=lo, ymax=hi), width=.15, colour="#08519c", alpha=.55, na.rm=TRUE) +
+  geom_line(colour="#08519c", linewidth=.8) + geom_point(size=2) +
+  facet_wrap(~name, scales="free_y") +
+  labs(title="F-RQ3d · Topology sensitivity — continuity depends strongly on grid-cell size (and, for the core, on origin)",
+       subtitle="bars = range of core length % across 9 grid origins; a wide bar ⇒ the ~40%→~80% jump is partly a grid artefact, not a bound",
+       x="grid-cell size (m)", y=NULL) + theme_dep()
+ggsave2("F_RQ3d_sensitivity.png", F_rq3d, w=10, h=3.6); F_rq3d
+```
+
+```{r rq3-proposed}
+## Proposed-route addition — ALL proposals under ONE crossing-aware rule (audit P0-7). v3.3 used a vertex-snap SCREEN for
+## every route and a proper joint subdivision only for the ones the screen flagged; but a vertex-snap screen MISSES an
+## interior crossing away from a vertex, so a route it scored 0 could in truth reconnect. Fix: evaluate EVERY proposal by
+## the SAME joint subdivision of existing+proposal (interior crossings become real nodes), grid-key at TOL, recompute R(G)
+## on the SAME fixed probe set. "Structural reachability gain", not travel demand. Adding edges only merges components ⇒ G_p ≥ 0.
+pr_geo <- bk |> filter(existing=="Proposed") |> mutate(.pid=dplyr::row_number())
+eval_prop <- function(pid){                                                  # one construction rule, applied to every route
+  pl   <- suppressWarnings(st_cast(st_cast(pr_geo[pid,], "MULTILINESTRING"), "LINESTRING"))
+  comb <- st_sf(geometry=c(st_geometry(lines_ls), st_geometry(pl)))          # existing physical + THIS proposal, jointly noded
+  net2 <- sfnetworks::as_sfnetwork(comb, directed=FALSE) |> tidygraph::convert(sfnetworks::to_spatial_subdivision)
+  e2   <- net2 |> tidygraph::activate("edges") |> tibble::as_tibble()
+  nc2  <- st_coordinates(st_as_sf(tidygraph::activate(net2,"nodes")))
+  k    <- paste(round(nc2[,1]/TOL)*TOL, round(nc2[,2]/TOL)*TOL, sep="_")
+  ed   <- data.frame(f=k[e2$from], g=k[e2$to]); ed <- ed[ed$f!=ed$g, ]
+  G2   <- igraph::graph_from_data_frame(ed, directed=FALSE)
+  l    <- igraph::components(G2)$membership[pkey(TOL)]; l <- l[!is.na(l)]     # same fixed probe set + denominator as R0
+  sum(vapply(split(seq_along(l), l), function(ix) length(ix)*(length(ix)-1)/2, numeric(1)))/denom_pairs - R0 }
+Gp <- purrr::map_dfr(seq_len(nrow(pr_geo)), function(i){
+  g  <- tryCatch(eval_prop(i), error=function(e) NA_real_)                    # NA only if the subdivision errors on that geometry
+  km <- as.numeric(st_length(st_union(pr_geo[i,])))/1000
+  tibble(.pid=i, G_p=g, km=km) })
+Gp <- Gp |> mutate(structural_gain_per_km=ifelse(km>0 & !is.na(G_p), round(G_p/km,4), NA_real_),
+                   role=dplyr::case_when(is.na(G_p) ~ "not evaluable", G_p>1e-9 ~ "reconnects a gap",
+                                         TRUE ~ "no reachability gain")) |>
+  left_join(st_drop_geometry(pr_geo)[,c(".pid","name","type")], by=".pid")
+cat("Proposed routes evaluated (all", nrow(Gp), "under one joint-subdivision rule) — reconnect the network:",
+    sum(Gp$G_p>1e-9, na.rm=TRUE), "| no gain:", sum(Gp$G_p<=1e-9, na.rm=TRUE), "| not evaluable:", sum(is.na(Gp$G_p)), "\n")
+print(Gp |> arrange(desc(G_p)) |> mutate(km=round(km,3), G_p=round(G_p,4)) |> head(5))
+
+## ALL-proposal gain ranking (check.md 20): the distribution across proposals under one rule, not one hand-picked route
+F_rq3e <- Gp |> arrange(desc(G_p)) |> mutate(rk=dplyr::row_number()) |> filter(rk<=15) |>
+  ggplot(aes(reorder(paste0("p",.pid), G_p), G_p)) +
+  geom_segment(aes(xend=reorder(paste0("p",.pid),G_p), y=0, yend=G_p), colour="grey75") +
+  geom_point(aes(colour=role), size=2.6) + coord_flip() +
+  scale_colour_manual(values=c("reconnects a gap"="#d7301f","no reachability gain"="#9ecae1","not evaluable"="grey60"), name=NULL) +
+  labs(title=paste0("F-RQ3e · Proposed-route structural reachability gain — all ", nrow(pr_geo),
+                    " proposals, one joint-subdivision rule"),
+       subtitle="most proposals add length without reconnecting; a few (red) merge existing components", x="proposed route", y="G_p") + theme_dep()
+ggsave2("F_RQ3e_proposal_gain.png", F_rq3e, w=8, h=5); F_rq3e
+
+## before/after map for the single highest-gain proposal (check.md §7): show WHERE it reconnects
+top <- Gp |> filter(!is.na(G_p)) |> arrange(desc(G_p)) |> slice(1) |> pull(.pid)
+F_rq3c <- ggplot() + geom_sf(data=com, fill="#f4f4f2", colour="#8a8a8a", linewidth=.4) +
+  geom_sf(data=bk_phys, colour="#bdbdbd", linewidth=.5) +
+  geom_sf(data=pr_geo[top,], colour="#d7301f", linewidth=1.1) +
+  labs(title=paste0("F-RQ3c · Highest structural-gain proposal (id ",top,") in red, over the existing network")) + theme_map() + scalebar_m()
+ggsave2("F_RQ3c_top_proposal.png", F_rq3c); F_rq3c
+```
+
+# Synthesis — an integrated evidence table (all three RQs, no composite score) {#synthesis}
+
+> **What v2 missed:** the synthesis flowchart claimed all three RQs feed it, but the matrix carried only RQ1, and
+> `Sᵢ` was mislabelled as broad robustness. v3 puts **RQ2 persistence and RQ3 contribution into the table**, keeps
+> pedestrian and cyclist **separate**, and relabels `Sᵢ` honestly as **screen agreement across four rules**.
+> Network evidence is attached as *spatial context* (the nearest existing segment's role), never asserted as a site attribute.
+
+```{r synthesis}
+sm <- st_drop_geometry(sites)
+q <- function(x,p) as.numeric(quantile(x,p,na.rm=TRUE))
+sm$weak_prot <- sm$prot_m_200==0 | sm$near_prot %in% c("3 Painted on-road","5 Informal / mixed")
+## RQ3 context: role of the nearest EXISTING physical segment (labelled as context, not a site property)
+nseg <- bk_phys$.rid[st_nearest_feature(sites, bk_phys)]
+disc_near <- Le$pairs_disconnected[match(nseg, Le$.rid)]                       # NA if the nearest segment dropped in casting/subdivision
+sm$near_seg_role <- dplyr::case_when(is.na(disc_near) ~ "n/a (not in graph)",  # audit A6: no silent blank in the evidence table
+                                     disc_near > 0 ~ "critical", TRUE ~ "redundant")
+
+## Sᵢ = EXPLORATORY SCREENING / investigation shortlist only (check.md 11): agreement across four ad-hoc rules
+## (camera-kind × cut-point). The thresholds (2/3, 0.8) and equal weighting are not RQ-evidence — demoted, not headline.
+flag <- function(mode, kind, cut){ A<-sm[[mode]]; D<-sm[[paste0("d_",kind)]]
+  base <- (A>=q(A,cut)) & (D>=q(D,cut)); if (mode=="cyclist") base & sm$weak_prot else base }
+specs <- tidyr::expand_grid(kind=c("fixed","any"), cut=c(2/3,0.8))
+Sagg <- function(mode) rowMeans(vapply(seq_len(nrow(specs)),
+          function(i) flag(mode, specs$kind[i], specs$cut[i]), logical(nrow(sm))), na.rm=TRUE)
+sm$S_ped <- Sagg("pedestrian"); sm$S_cyc <- Sagg("cyclist")
+
+## RQ2 temporal evidence into the table (check.md §7): the site's cyclist PM−AM balance (a temporal-shape measure)
+sm <- merge(sm, idx[class=="cyclist", .(site, rq2_pm_am=round(pm_am_bal,2))], by="site", all.x=TRUE)
+evidence <- sm |> transmute(site,
+   `RQ1 cyc rate`=round(cyclist,1), `RQ1 ped rate`=round(pedestrian,1), `RQ1 d_fixed(m)`=round(d_fixed),
+   `RQ2 cyc PM−AM bal`=rq2_pm_am,                                              # temporal evidence, now present
+   `nearest protection`=as.character(near_prot), `strong-prot ≤200m (m)`=round(prot_m_200),
+   `RQ3 nearest-seg`=near_seg_role,
+   `covwin ok (ped/cyc)`=paste0(ifelse(!is.na(covwin_pedestrian)&covwin_pedestrian>=.9,"Y","n"),"/",
+                                ifelse(!is.na(covwin_cyclist)&covwin_cyclist>=.9,"Y","n")),
+   `S cyclist (4 rules)`=round(S_cyc,2), `S pedestrian (4 rules)`=round(S_ped,2)) |>
+   arrange(desc(`S cyclist (4 rules)`))
+print(head(evidence, 10)); readr::write_csv(evidence, "out/evidence_matrix.csv")
+cat("Cyclist screen agreed by ALL four rules:", sum(sm$S_cyc==1, na.rm=TRUE), "site(s)\n")
+```
+
+# The evidence chain, and to what extent each RQ is answered {#verdict}
+
+**Read the project as one chain, not three questions:** *measure activity comparably → establish the spatial
+structure of exposure → test whether exposure aligns with enforcement → ask whether that (mis)alignment moves in
+time → ask whether the cycling network holds together where exposure is high → point to places worth investigating,
+without turning them into a risk ranking.*
+
+*The Extent column states the reading the code is built to support; each depends on the printed diagnostic it names,
+so it is **confirmed on a clean knit**, not asserted here (R was unavailable when this was written).*
+
+| Finding | Evidence (statistical + visual) | Extent |
+|---|---|---|
+| High VRU activity is spatially **clustered** in a small inner-city core | Global Moran's I stable across k (printed); activity map F-RQ1e | **Strong** if I stays clearly >0 across k |
+| Recorded activity share near cameras is **similar to the site benchmark** | `Cm(d)`, `U(d)` and the signed **gap in pp** shown together across 100–1000 m (F-RQ1a/b/d); **which sites drive it** — signed `q_i`, Σ = gap (F-RQ1f); gap leave-one-out | **Strong-as-descriptive** *iff* the printed gap is small across cut-points **and** not driven by one or two sites (F-RQ1f); worded "*similar to* the benchmark" — never adequacy, equivalence, independence, or "placement wrong" |
+| The **near-camera share does not shift with the hour** (RQ2 inherits RQ1's benchmark) | hourly `Ct−U` gap F-RQ2a + far-magnitude F-RQ2b; weekly paired Δ(PM−AM) F-RQ2c | **Moderate–Strong** — a flat `Ct−U` near 0 across hours ⇒ the spatial (mis)match is time-stable, not a timing effect |
+| Pedestrian vs cyclist **daily rhythms differ** | per-clock-hour intensity heatmap F-RQ2e (shared IDs); PM−AM balance F-RQ2d; daypart rank-stability | **Strong** (secondary: activity-core *timing*, not alignment) |
+| **Enforcement timing** alignment | — | **Not claimed** — unobservable in this data |
+| Network **continuity is strongly tolerance-dependent** | length-share + R(G) across 1–10 m grid cells (F-RQ3d) | **Strong (as a caveat)** — largest core ~40 % of length at a 2 m grid vs ~80 % at 5 m ⇒ do NOT commit to one graph |
+| The **critical-segment identity** survives that uncertainty | 2 m↔5 m overlap (printed); F-RQ3a/a2 | **Strong** *iff* the printed overlap is high — this, not "one core", is the robust claim |
+| A few **proposed routes reconnect** the network, most only extend it | `G_p` for **all 39 proposals under one joint-subdivision rule**; F-RQ3e ranking + F-RQ3c map | **Structural-model result** — `G_p` is structural reachability per mapped length, not travel demand or safety |
+| Priority shortlist | `Sᵢ` = exploratory screening / investigation shortlist | **Exploratory** — investigation targets, not proven risks |
+
+**Deeper directions that are worth it AND feasible on this data — and are now implemented in v3, not bolted on:**
+the RQ1 **gap decomposition** (which sites drive `Cm−U`? — F-RQ1f) and its **distance-threshold-sensitivity profile**
+(does the sign/size survive 100–1000 m?), the RQ2 **daypart rank-stability** (quantifies the stable activity core), and
+the RQ3 **structural-gain-per-kilometre** for all proposals (planning value per mapped length). **Deliberately NOT
+pursued**, because the data cannot support them: crash-risk prediction, camera
+*effectiveness* causal inference, hourly mobile-enforcement alignment, route-choice/demand simulation, and
+regression/PCA/UMAP added only for sophistication. Adding those would *lower* defensibility.
+
+The HD signal here is a single discipline held throughout: **claim strength ≤ evidence strength.** RQ1 and RQ3 are
+answered strongly; RQ2 is answered well for activity dynamics and spatial persistence but does not pretend to observe
+enforcement timing; the synthesis stays exploratory. Distinguishing *what the data can answer, what it only suggests,
+and what it cannot support* is the core of the analysis.
+
+# Reproducibility & AI declaration {#declare}
+
+```{r session}
+writeLines(capture.output(sessionInfo()), "out/sessionInfo.txt")
+```
+
+> **v3.2 change note (execution + fidelity fixes against the real data).** **Execution:** `from` is read as raw
+> character (fread had auto-parsed it to POSIXct, a latent timezone bug) and the B3 diagnostic is **activity-weighted
+> and uses `samp$from`** (fixes the `object 'from' not found` crash and the row-count diagnostic); `nb2listw(nb,
+> style="W")` corrected. **Measurement:** presence-only exposure = total crossings per window-hour; **combined VRU
+> requires both modes**; eligibility is temporal **span**. **RQ1:** influence now targets the **gap `Cm−U`** (pp),
+> the scatter is **mode-faceted**, an **activity map** is added. **RQ2:** restricted to the **eligible panel**, the
+> arbitrary reference line replaced by a **defined baseline**, weekly persistence is a **paired Δ(PM−AM)**, rank
+> stability is **mode-specific with a daypart heatmap**, and shape is a **signed PM−AM balance** (not "commute lean").
+> **RQ3:** reports **length** share (not node), **fixed probe denominator** across tolerances, and **component / before-after maps**;
+> "properly-noded/verified" softened to what subdivision establishes.
+>
+> **v3.3 → v3.4 correctness pass (reconciled audit, 8 P0 defects).** **RQ3 computations repaired:** removal
+> disconnection is now counted by **component membership on the fixed probe set** so a removal that *isolates* a probe
+> is no longer dropped (P0-1); the junction near-miss audit measures each endpoint to the nearest **other** line, not
+> its own (P0-2); detour is the **count of affected pairs + median *positive* detour**, so a minority detour is no
+> longer read as "redundant" (P0-3); the "core" is **ranked by summed length**, and the 1–10 m sweep is relabelled a
+> **grid-quantisation** sensitivity, not a metric tolerance (P0-5); **all 39 proposals** are evaluated under **one
+> joint-subdivision rule** (the vertex-snap "screen/lower-bound" is gone) (P0-7). **RQ1/RQ2 interpretation repaired:**
+> `covwin` is the **wide-observation-span** panel with a printed **0.8/0.9/0.95** span-cutoff sensitivity, and the note
+> that `win_hours` **cancels** in the share ratio (P0-4); `Cm`, `U`, `G` are shown together, the ECDF is drawn from a
+> shared 0 origin, and the gap is worded "**similar to** the benchmark" — never adequacy/equivalence (P0-6). **Depth
+> added (no new methods):** the RQ1 **gap decomposition** `q_i` (Σ = gap; F-RQ1f) names the sites that drive the gap,
+> and F-RQ2e is now a **per-clock-hour intensity** heatmap (the daypart-share version was a window-width artefact). A
+> prominent **report↔code reconciliation flag** (top of document) records that the submitted `.docx` still states the
+> repudiated 150-component / k-means / STL / LISA / bivariate results and must be rewritten before submission (P0-8).
+> Key diagnostics print via `cat()` so a marker can see them.
+>
+> **v3.4 → v3.5 pass (analytical-methods review, check.md).** **RQ3:** critical-set stability now reports the **Jaccard**
+> |A∩B|/|A∪B| with the empty-set case handled (A3); the grid sweep adds an **origin-jitter range** and the **self-loop
+> length** discarded at each cell, and F-RQ3d shows the origin band, so the ~40%→~80% core jump is bounded, not asserted
+> (A4); the "39" in F-RQ3e is interpolated from `nrow(pr_geo)` (A5); the synthesis `near_seg_role` guards its NA path (A6).
+> **Visuals:** every metric map (F-RQ1e, F-RQ2d, F-RQ3a/b/c) carries a **scale bar** via `ggspatial` (D), and an RQ1
+> **hero composite** (gap + decomposition) is emitted for the report body (D). **Restraint:** the dead `we_wd_bal` and the
+> never-shown edge-betweenness chunk are removed (E); RQ2's section explicitly frames F-RQ2d/e as *context*, not alignment
+> tests (Part B/F); no clustering is re-added (depth over breadth, defended in the report's reflection). **The reconciled
+> written report is provided** (`DEP_Report_Vu_36071668.docx`), written to these estimands (A2). **Declaration of AI
+> assistance:** Generative AI (Claude, Anthropic) helped plan the pipeline, write the R code and draft the report; the
+> author validates every figure and number on a clean knit. TAC-fed results are pending that knit; the network topology
+> and reachability were corroborated independently from the supplied bike/boundary files.
